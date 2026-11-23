@@ -1323,6 +1323,43 @@ void ggml_vec_dot_iq3_ks_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs,
     *s = sumf;
 }
 
+// iq4_ks: a thread-less reference dot: per block of 32, the 7-bit signed scale + grid bit from the scale byte,
+// nibbles lo = weight j, hi = weight j+16
+void ggml_vec_dot_iq4_ks_q8_K_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_K == 0);
+
+    const block_iq4_ks * GGML_RESTRICT x = vx;
+    const block_q8_K   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+    float sumf = 0;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const float d = x[ibl].d;
+        int32_t sumi = 0;
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const uint8_t sb = x[ibl].scales[ib32];
+            const int8_t * values = (sb & 1) ? iq4k_values + 16 : iq4k_values;
+            const int ls = (int)(sb & 254) - 127;
+            const uint8_t * qs = x[ibl].qs + 16*ib32;
+            const int8_t  * q8 = y[ibl].qs + 32*ib32;
+            int32_t s32 = 0;
+            for (int j = 0; j < 16; ++j) {
+                s32 += values[qs[j] & 0xf] * q8[j];
+                s32 += values[qs[j] >> 4]   * q8[j+16];
+            }
+            sumi += ls * s32;
+        }
+        sumf += d * y[ibl].d * sumi;
+    }
+    *s = sumf;
+}
+
 void ggml_vec_dot_iq4_nl_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);

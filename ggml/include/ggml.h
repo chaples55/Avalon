@@ -432,7 +432,9 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_IQ3_K   = 43, // ik_llama.cpp's IQ3_K (type 138 there): the block and grid are the same
         GGML_TYPE_IQ3_KS  = 44, // ik_llama.cpp's IQ3_KS codebook and layout, with a block scale instead of its row scale (104 B / 256)
-        GGML_TYPE_COUNT   = 45,
+        GGML_TYPE_IQ4_KS  = 45, // ik_llama.cpp's IQ4_KS codebook, scale, and block layout: a float super-block scale,
+                                // a 7-bit signed scale + grid bit per block of 32, 4-bit grid indices (140 B / 256)
+        GGML_TYPE_COUNT   = 46,
     };
 
     // [TAG_GGML_PREC]

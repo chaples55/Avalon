@@ -485,6 +485,16 @@ typedef struct {
 } block_iq3_ks;
 static_assert(sizeof(block_iq3_ks) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/4 + QK_K/8, "wrong iq3_ks block size/padding");
 
+// iq4_ks (ik_llama.cpp's IQ4_KS codebook, scale, and layout under Avalon's own type id): 4.375 bpw. A float
+// super-block scale, a 7-bit signed scale (bits 1-7: 2*ls - 127) plus the grid bit (bit 0) per block of 32, and
+// 4-bit indices into the 16-value iq4_k grid: weight j in the low nibble of qs[j], weight j+16 in its high nibble.
+typedef struct {
+    float d;
+    uint8_t scales[QK_K/32];
+    uint8_t qs[QK_K/2];
+} block_iq4_ks;
+static_assert(sizeof(block_iq4_ks) == sizeof(float) + QK_K/32 + QK_K/2, "wrong iq4_ks block size/padding");
+
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL
 
@@ -1151,6 +1161,12 @@ GGML_TABLE_END()
 GGML_TABLE_BEGIN(int8_t, iq3nl_values, 16)
     -63, -40, -23, -10, 1, 13, 28,  47,
     -59, -36, -19,  -6, 5, 17, 32,  51,
+GGML_TABLE_END()
+
+// iq4_ks grid (ik_llama.cpp's iq4_k values): the 16 values, then the same shifted (block scale byte's grid bit set)
+GGML_TABLE_BEGIN(int8_t, iq4k_values, 32)
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
 GGML_TABLE_END()
 
 // e2m1 values (doubled), shared by MXFP4 and NVFP4

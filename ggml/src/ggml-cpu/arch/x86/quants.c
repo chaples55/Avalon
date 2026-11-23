@@ -4079,6 +4079,57 @@ void ggml_vec_dot_iq3_ks_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 #endif
 }
 
+// iq4_ks: the grid values span -127..117, too wide for the maddubs pair trick the iq3_ks kernel uses, so widen
+// to int16: nibbles expand through pshufb to int8 grid values in natural order (lo = weights 0..15, hi = 16..31),
+// madd_epi16 keeps the products exact, the per-block signed scale folds in via a per-block horizontal sum.
+void ggml_vec_dot_iq4_ks_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_K == 0);
+
+#if defined __AVX2__
+    const block_iq4_ks * GGML_RESTRICT x = vx;
+    const block_q8_K   * GGML_RESTRICT y = vy;
+    const int nb = n / QK_K;
+
+    static const int8_t values_n[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+    static const int8_t values_s[16] = { -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117 };
+
+    const __m128i m4 = _mm_set1_epi8(0xf);
+    const __m128i vn = _mm_loadu_si128((const __m128i *) values_n);
+    const __m128i vs = _mm_loadu_si128((const __m128i *) values_s);
+
+    float sumf = 0;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const float d = x[ibl].d;
+        int32_t sumi = 0;
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const uint8_t sb = x[ibl].scales[ib32];
+            const __m128i tab = (sb & 1) ? vs : vn;
+            const int ls = (int)(sb & 254) - 127;
+            const __m128i qs = _mm_loadu_si128((const __m128i *) (x[ibl].qs + 16*ib32));
+            const __m128i v_lo = _mm_shuffle_epi8(tab, _mm_and_si128(qs, m4));
+            const __m128i v_hi = _mm_shuffle_epi8(tab, _mm_and_si128(_mm_srli_epi16(qs, 4), m4));
+            const __m256i v  = MM256_SET_M128I(v_hi, v_lo);
+            const __m256i q8 = _mm256_loadu_si256((const __m256i *) (y[ibl].qs + 32*ib32));
+            const __m256i p = _mm256_add_epi32(
+                    _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_castsi256_si128(v)),
+                                      _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q8))),
+                    _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1)),
+                                      _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q8, 1))));
+            sumi += ls * hsum_i32_8(p);
+        }
+        sumf += d * y[ibl].d * sumi;
+    }
+    *s = sumf;
+#else
+    ggml_vec_dot_iq4_ks_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
