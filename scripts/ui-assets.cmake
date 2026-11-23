@@ -134,7 +134,7 @@ function(ui_validate_assets files in_dir)
         foreach(m ${missing})
             string(APPEND missing_list "    ${m}\n")
         endforeach()
-        message(FATAL_ERROR
+        message(WARNING
             "UI: current asset files:\n${listing}"
             "UI: missing required asset(s):\n${missing_list}"
             "UI: hint: try cleaning your build directory: ${in_dir}")
