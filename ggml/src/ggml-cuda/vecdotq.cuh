@@ -1712,3 +1712,53 @@ static __device__ __forceinline__ float vec_dot_iq3_ks_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iiqs) {
     return vec_dot_iq3_ks_q8_1_words(iq3_ks_load(vbq, kbx, iiqs), bq8_1, iiqs);
 }
+// iq4_ks (Avalon: ik_llama.cpp's IQ4_KS codebook, scale, and block layout): thread iqs = iiqs/4 (0..7) takes one
+// block of 32. The scale byte holds the 7-bit signed scale (2*ls - 127, bits 1-7) plus the grid bit (bit 0); the
+// nibbles are weight j in the low half of qs[j] and weight j+16 in its high half, so 4 words per thread dp4a
+// against the single q8_1 block covering the same 32 weights (ds.x first half, ds.y second).
+#define VDR_IQ4_KS_Q8_1_MMVQ 4
+#define VDR_IQ4_KS_Q8_1_MMQ  4
+
+static __device__ __forceinline__ float vec_dot_iq4_ks_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iiqs) {
+
+    const block_iq4_ks * const bq4 = (const block_iq4_ks *) vbq + kbx;
+
+    // KS-family mmvq lane convention (mirrors the proven vec_dot_iq3_ks_q8_1): with VDR = 4 there are 8 lanes per
+    // 256-value block: iiqs = 4*lane, lane = 4*ib128 + il8, ib128 the 128-value half, il8 = 0..3.
+    // Lane (ib128, il8) reads, for each of the 4 sub-blocks j of its half, the int at qs byte 4*il8: byte b holds
+    // weight 4*il8+b (low nibble) and weight 16+4*il8+b (high nibble), matching dequantize_row_iq4_ks on the CPU.
+    // Like every KS-family vec_dot, the y scale is ds.x for the whole block of 32 (ds.y is the sum field of the
+    // q8_1 encoding, __low2float everywhere else) — do not scale the high half by ds.y.
+    const int iqs = iiqs / 4;
+    const int ib128 = iqs / 4;
+    const int il8 = iqs % 4;
+
+    const float d = bq4->d;
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int sub = 4*ib128 + j;
+        const uint8_t sbj = bq4->scales[sub];
+        const int8_t * const values = iq4k_values + ((sbj & 1) << 4);
+        const float dl = d * (float) ((int) (sbj & 254) - 127);
+        const float yds = __low2float(bq8_1[sub].ds);
+
+        const int word = ((const int *) (bq4->qs + 16*sub))[il8];
+        const int8_t * const yx = bq8_1[sub].qs + 4*il8;
+        const int8_t * const yy = yx + 16;
+
+        float sx = 0.0f;
+        float sy = 0.0f;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            sx += (float) values[(word >> (8*b     )) & 0xF] * (float) yx[b];
+            sy += (float) values[(word >> (8*b + 4)) & 0xF] * (float) yy[b];
+        }
+
+        sum += dl * yds * (sx + sy);
+    }
+
+    return sum;
+}

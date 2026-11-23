@@ -1,5 +1,14 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include <cstdlib>
+static inline int mmq_j_lo() {
+    static const int v = [](){ const char * s = std::getenv("GGML_CUDA_MMQ_J_MIN"); int x = s ? std::atoi(s) : 8; return (x >= 8 && x <= 128) ? x : 8; }();
+    return v;
+}
+static inline int mmq_j_hi() {
+    static const int v = [](){ const char * s = std::getenv("GGML_CUDA_MMQ_J_MAX"); int x = s ? std::atoi(s) : 128; return (x >= 8 && x <= 128) ? x : 128; }();
+    return v;
+}
 
 // each expert's first column tile of width J in the compact MUL_MAT_ID grid (prefix[e]: tiles of the experts before e,
 // prefix[n]: all of them), from mm_ids_helper's row bounds; one thread: 512 experts in a few microseconds
@@ -110,6 +119,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
             break;
         case GGML_TYPE_IQ3_KS:
             mul_mat_q_case<GGML_TYPE_IQ3_KS, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ4_KS:
+            mul_mat_q_case<GGML_TYPE_IQ4_KS, GGML_PREC_Q8>(ctx, args, stream);
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8>(ctx, args, stream);
@@ -409,7 +421,7 @@ void ggml_cuda_mul_mat_q(
 
         int ntiles_J_best = INT_MAX;
 
-        for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        for (int J = mmq_j_lo(); J <= mmq_j_hi() && ntiles_J_best > 1; J += 8) {
             const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(src0->type, J, fallback, cc, prec_src1);
             if (config.type == GGML_TYPE_COUNT) {
                 continue;
@@ -429,6 +441,14 @@ void ggml_cuda_mul_mat_q(
         }
     }
     GGML_ASSERT(J_best > 0);
+    if (std::getenv("GGML_CUDA_MMQ_LOG")) {
+        static int mmq_logged[GGML_TYPE_COUNT][17] = {{0}};
+        const int ji = J_best / 8;
+        if (ji >= 0 && ji < 17 && src0->type < GGML_TYPE_COUNT && !mmq_logged[src0->type][ji]) {
+            mmq_logged[src0->type][ji] = 1;
+            GGML_LOG_INFO("%s: MMQ chose type=%s J=%d nthreads=%d\n", __func__, ggml_type_name(src0->type), J_best, nthreads_best);
+        }
+    }
 
     // RDNA3, a prompt batch against a 2D Q8_0 weight: the FP16 product (dense-f16.cu), its FP16 weight in the scratch in
     // place of the quantized activation, which a next product of the group would then quantize again. Not when the
@@ -662,6 +682,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ3_K:
         case GGML_TYPE_IQ3_KS:
+        case GGML_TYPE_IQ4_KS:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
 // -------------------------------------------------
@@ -831,7 +852,7 @@ static __global__ void k_moe_sum_first_rows(const int32_t * __restrict__ ids, co
 static int mmq_pick_J(ggml_type type, int64_t ncols_opt, bool fallback, int cc, size_t smpbo, ggml_prec prec_src1,
         bool summed = false) {
     int J_best = 0, ntiles_J_best = INT_MAX;
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    for (int J = mmq_j_lo(); J <= mmq_j_hi() && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
         if (config.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(config, cc, summed) > smpbo) {
             continue;
