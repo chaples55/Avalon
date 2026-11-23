@@ -1099,9 +1099,13 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 // sources go through the bounce buffer before this)
 static cudaError_t ggml_cuda_memcpy_2d_h2d_async(void * dst, size_t dpitch, const void * src, size_t spitch,
         size_t width, size_t height, cudaStream_t stream) {
-#if defined(GGML_USE_HIP) && defined(_WIN32)
+#if defined(GGML_USE_HIP)
+    // hipMemcpy2DAsync rejects pitch 0 (ROCclr reads it literally, CUDA reads it as contiguous) and copies
+    // zeros from mmap'ed files on Windows: resolve pitch 0 to the width and copy per row
+    const size_t dp = dpitch ? dpitch : width;
+    const size_t sp = spitch ? spitch : width;
     for (size_t i = 0; i < height; i++) {
-        const cudaError_t err = cudaMemcpyAsync((char *) dst + i*dpitch, (const char *) src + i*spitch, width, cudaMemcpyHostToDevice, stream);
+        const cudaError_t err = cudaMemcpyAsync((char *) dst + i*dp, (const char *) src + i*sp, width, cudaMemcpyHostToDevice, stream);
         if (err != cudaSuccess) {
             return err;
         }
@@ -3603,6 +3607,22 @@ struct ggml_cuda_host_bounce {
 };
 static ggml_cuda_host_bounce g_host_bounce[GGML_CUDA_MAX_DEVICES];
 
+// A private stream for host-to-device copies that must complete before a graph replays: ROCclr
+// rejects such copies on the compute stream (graph-adjacent, invalid argument) and on the legacy
+// null stream (implicit-sync semantics, unsupported next to a graph)
+static cudaStream_t g_h2d_sync_stream[GGML_CUDA_MAX_DEVICES] = {};
+static std::mutex g_h2d_sync_mu;
+static cudaStream_t ggml_cuda_h2d_sync_stream(int device) {
+    std::lock_guard<std::mutex> lock(g_h2d_sync_mu);
+    if (!g_h2d_sync_stream[device]) {
+        if (hipStreamCreate(&g_h2d_sync_stream[device]) != hipSuccess) {
+            (void) hipGetLastError();
+            return ggml_cuda_once_stream(device);   // legacy DMA, better than nothing
+        }
+    }
+    return g_h2d_sync_stream[device];
+}
+
 static void ggml_cuda_host_bounce_wait(cudaEvent_t event) {
     if (!ggml_cuda_moe_hosted_wait(nullptr, event, -1)) {
         CUDA_CHECK(cudaEventSynchronize(event));
@@ -3617,6 +3637,7 @@ bool ggml_cuda_host_copy_bounce(char * dst, size_t dpitch, const char * src, siz
     if (width == 0 || height == 0 || width * height <= ggml_cuda_host_copy_kernel_min ||
         !ggml_cuda_host_ptr_pageable(src)) {
         return false;
+        return false;
     }
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
@@ -3629,6 +3650,7 @@ bool ggml_cuda_host_copy_bounce(char * dst, size_t dpitch, const char * src, siz
         const size_t bytes = (size_t) ggml_cuda_host_bounce_slots * ggml_cuda_host_bounce_bytes;
         if (hipHostMalloc((void **) &b.host, bytes, hipHostMallocPortable | hipHostMallocCoherent) != hipSuccess ||
             !b.host || !(b.dev = ggml_cuda_pinned_device_ptr(b.host))) {
+
             (void) hipGetLastError();
             b.host = nullptr;
             return false;
@@ -3757,7 +3779,23 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         return;
     }
 #endif
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+    (void) hipStreamIsCapturing((hipStream_t) cuda_ctx->stream(), &cs);
+    if (cs != hipStreamCaptureStatusNone) {
+        // graph-capture context: a host-to-device memcpy cannot be captured (ROCclr rejects it with
+        // invalid argument) while the graph's input tensors are set here, once: run it synchronously on
+        // the device's once stream, so the data is in device memory before the capture replays
+        cudaStream_t st = ggml_cuda_h2d_sync_stream(cuda_ctx->device);
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, st));
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        return;
+    }
+    
+    // ROCclr rejects a host-to-device DMA queued on the compute stream (graph-adjacent, pinned sources
+    // included, invalid argument); the device's once stream with a synchronous DMA is the proven path
+    cudaStream_t st = ggml_cuda_h2d_sync_stream(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, st));
+    CUDA_CHECK(cudaStreamSynchronize(st));
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3795,8 +3833,27 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
         return;
     }
 #endif
-    CUDA_CHECK(ggml_cuda_memcpy_2d_h2d_async(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cuda_ctx->stream()));
+    hipStreamCaptureStatus cs = hipStreamCaptureStatusNone;
+    (void) hipStreamIsCapturing((hipStream_t) cuda_ctx->stream(), &cs);
+    if (cs != hipStreamCaptureStatusNone) {
+        cudaStream_t st = ggml_cuda_h2d_sync_stream(cuda_ctx->device);
+        const size_t dp = stride_tensor ? stride_tensor : size;
+        const size_t sp = stride_data   ? stride_data   : size;
+        for (size_t i = 0; i < n_copies; i++) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + i*dp, (const char *) data + i*sp, size,
+                                   cudaMemcpyHostToDevice, st));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st));
+        return;
+    }
+    cudaStream_t st = ggml_cuda_h2d_sync_stream(cuda_ctx->device);
+    const size_t dp = stride_tensor ? stride_tensor : size;
+    const size_t sp = stride_data   ? stride_data   : size;
+    for (size_t i = 0; i < n_copies; i++) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset + i*dp, (const char *) data + i*sp, size,
+                                   cudaMemcpyHostToDevice, st));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(st));
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
